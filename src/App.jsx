@@ -969,19 +969,27 @@ function Confirmation({ order, goTo, account }) {
 /* ============================================================
    ACCOUNT
    ============================================================ */
+/* Change ce mot de passe pour le tien — c'est lui qui protège l'accès admin.
+   Ce n'est pas un système de sécurité professionnel (le mot de passe est
+   visible dans le code source), mais il empêche n'importe quel visiteur
+   de devenir admin en un clic. Pour une vraie sécurité, il faudra brancher
+   une authentification Supabase plus tard. */
+const ADMIN_PASSWORD = "voxforge-admin-2026";
+
 function Account({ account, setAccount, orders, goTo, showToast }) {
-  const [form, setForm] = useState({ name: "", email: "", isAdmin: false });
+  const [form, setForm] = useState({ name: "", email: "", wantsAdmin: false, adminPassword: "" });
   const [attempted, setAttempted] = useState(false);
 
   if (!account) {
     const nameError = form.name.trim().length < 2 ? "Indiquez votre nom (2 caractères min)." : "";
     const emailError = !EMAIL_RE.test(form.email) ? "Adresse email invalide." : "";
-    const valid = !nameError && !emailError;
+    const passwordError = form.wantsAdmin && form.adminPassword !== ADMIN_PASSWORD ? "Mot de passe administrateur incorrect." : "";
+    const valid = !nameError && !emailError && !passwordError;
 
     const submit = () => {
       setAttempted(true);
       if (!valid) return;
-      setAccount(form);
+      setAccount({ name: form.name, email: form.email, isAdmin: form.wantsAdmin });
       showToast(`Bienvenue, ${form.name}`);
     };
 
@@ -997,9 +1005,14 @@ function Account({ account, setAccount, orders, goTo, showToast }) {
             <input placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
           </FormField>
           <label className="vf-check">
-            <input type="checkbox" checked={form.isAdmin} onChange={(e) => setForm({ ...form, isAdmin: e.target.checked })} />
-            Se connecter en tant qu'administrateur (démo)
+            <input type="checkbox" checked={form.wantsAdmin} onChange={(e) => setForm({ ...form, wantsAdmin: e.target.checked, adminPassword: "" })} />
+            Je suis l'administrateur
           </label>
+          {form.wantsAdmin && (
+            <FormField error={attempted && passwordError}>
+              <input type="password" placeholder="Mot de passe administrateur" value={form.adminPassword} onChange={(e) => setForm({ ...form, adminPassword: e.target.value })} />
+            </FormField>
+          )}
         </div>
         <button className="vf-btn vf-btn-primary" style={{ marginTop: 16 }} onClick={submit}>
           Se connecter
@@ -1540,3 +1553,4 @@ html, body { background:#0a0a0f; margin:0; }
 .vf-toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:var(--cyan); color:#04121a; padding:11px 20px; border-radius:10px; display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; z-index:100; box-shadow:0 6px 24px rgba(0,240,255,0.35); animation:vf-toast-in .2s ease; }
 @keyframes vf-toast-in { from{ opacity:0; transform:translate(-50%,10px);} to{ opacity:1; transform:translate(-50%,0);} }
 `;
+
