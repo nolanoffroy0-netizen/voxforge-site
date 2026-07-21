@@ -1327,7 +1327,11 @@ const CSS = `
   background:var(--void); color:var(--text); font-family:'Inter',sans-serif;
   min-height:100vh; position:relative; overflow-x:hidden;
 }
+html, body { background:#0a0a0f; margin:0; }
 .vf-root * { box-sizing:border-box; }
+.vf-root button, .vf-root input, .vf-root select, .vf-root textarea {
+  color:inherit; font:inherit;
+}
 .vf-root a:focus-visible, .vf-root button:focus-visible, .vf-root input:focus-visible, .vf-root select:focus-visible, .vf-root textarea:focus-visible {
   outline:2px solid var(--cyan); outline-offset:2px; border-radius:4px;
 }
