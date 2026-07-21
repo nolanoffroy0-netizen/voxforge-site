@@ -6,6 +6,7 @@ import {
   ArrowLeft, Edit2, PlusCircle, ShieldCheck, Truck, RotateCw, MapPin,
   Phone, ChevronRight, Loader2, AlertCircle
 } from "lucide-react";
+import { supabase } from "./supabaseClient";
 
 /* ============================================================
    VOXFORGE — boutique d'objets imprimés en 3D
@@ -93,11 +94,12 @@ const euros = (n) => n.toLocaleString("fr-FR", { style: "currency", currency: "E
 
 /* ---------------- Persistent storage helpers ----------------
    NOTE: en dehors de l'environnement Claude, window.storage n'existe pas.
-   On utilise localStorage pour le moment (fonctionne pour un seul visiteur
-   à la fois). Cette fonction sera remplacée par de vrais appels Supabase
-   à l'étape suivante, pour que le stock et les produits soient partagés
-   entre TOUS les visiteurs du site. */
-async function storageGet(key, shared = false) {
+   On utilise localStorage pour le panier, les commandes et le profil —
+   ce sont des données propres à chaque visiteur, pas besoin de les
+   partager. Les produits, eux, viennent maintenant de Supabase (voir
+   plus bas), pour que le catalogue et le stock soient les mêmes pour
+   tout le monde. */
+async function storageGet(key) {
   try {
     const raw = localStorage.getItem(`voxforge:${key}`);
     return raw ? JSON.parse(raw) : null;
@@ -105,12 +107,52 @@ async function storageGet(key, shared = false) {
     return null;
   }
 }
-async function storageSet(key, value, shared = false) {
+async function storageSet(key, value) {
   try {
     localStorage.setItem(`voxforge:${key}`, JSON.stringify(value));
   } catch {
     /* ignore */
   }
+}
+
+/* ---------------- Supabase: produits partagés ---------------- */
+async function fetchProducts() {
+  const { data, error } = await supabase.from("products").select("*").order("name");
+  if (error) {
+    console.error("Erreur chargement produits:", error.message);
+    return [];
+  }
+  return data || [];
+}
+async function insertProductRemote(product) {
+  const { data, error } = await supabase.from("products").insert(product).select().single();
+  if (error) throw new Error(error.message);
+  return data;
+}
+async function updateProductRemote(id, patch) {
+  const { data, error } = await supabase.from("products").update(patch).eq("id", id).select().single();
+  if (error) throw new Error(error.message);
+  return data;
+}
+async function deleteProductRemote(id) {
+  const { error } = await supabase.from("products").delete().eq("id", id);
+  if (error) throw new Error(error.message);
+}
+async function decrementStockRemote(id, qty) {
+  const { error } = await supabase.rpc("decrement_stock", { pid: id, qty });
+  if (error) console.error("Erreur mise à jour du stock:", error.message);
+}
+async function insertOrderRemote(order) {
+  const { error } = await supabase.from("orders").insert({
+    id: order.id,
+    items: order.items,
+    shipping_info: order.shippingInfo,
+    subtotal: order.subtotal,
+    shipping: order.shipping,
+    total: order.total,
+    status: order.status,
+  });
+  if (error) console.error("Erreur enregistrement commande:", error.message);
 }
 
 /* ---------------- Small UI atoms ---------------- */
@@ -200,31 +242,31 @@ export default function App() {
   /* ---- initial load ---- */
   useEffect(() => {
     (async () => {
-      const [storedProducts, storedCart, storedOrders, storedAccount] = await Promise.all([
-        storageGet("products", true),
-        storageGet("cart", false),
-        storageGet("orders", false),
-        storageGet("account", false),
+      const [remoteProducts, storedCart, storedOrders, storedAccount, { data: sessionData }] = await Promise.all([
+        fetchProducts(),
+        storageGet("cart"),
+        storageGet("orders"),
+        storageGet("account"),
+        supabase.auth.getSession(),
       ]);
-      if (storedProducts && Array.isArray(storedProducts) && storedProducts.length) {
-        setProducts(storedProducts);
-      } else {
-        await storageSet("products", DEFAULT_PRODUCTS, true);
-      }
+      setProducts(remoteProducts);
       if (storedCart) setCart(storedCart);
       if (storedOrders) setOrders(storedOrders);
-      if (storedAccount) setAccount(storedAccount);
+      if (sessionData?.session?.user) {
+        setAccount({ name: storedAccount?.name || sessionData.session.user.email, email: sessionData.session.user.email, isAdmin: true });
+      } else if (storedAccount) {
+        setAccount(storedAccount);
+      }
       setLoading(false);
     })();
   }, []);
 
-  useEffect(() => { if (!loading) storageSet("cart", cart, false); }, [cart, loading]);
-  useEffect(() => { if (!loading) storageSet("orders", orders, false); }, [orders, loading]);
-  useEffect(() => { if (!loading) storageSet("account", account, false); }, [account, loading]);
+  useEffect(() => { if (!loading) storageSet("cart", cart); }, [cart, loading]);
+  useEffect(() => { if (!loading) storageSet("orders", orders); }, [orders, loading]);
+  useEffect(() => { if (!loading) storageSet("account", account); }, [account, loading]);
 
-  const persistProducts = useCallback((next) => {
-    setProducts(next);
-    storageSet("products", next, true);
+  const refreshProducts = useCallback(async () => {
+    setProducts(await fetchProducts());
   }, []);
 
   const goTo = (p, id = null) => {
@@ -259,7 +301,7 @@ export default function App() {
   const subtotal = useMemo(() => cartDetailed.reduce((s, it) => s + it.product.price * it.qty, 0), [cartDetailed]);
   const cartCount = useMemo(() => cart.reduce((s, it) => s + it.qty, 0), [cart]);
 
-  const placeOrder = (shippingInfo) => {
+  const placeOrder = async (shippingInfo) => {
     const shipping = subtotal >= 50 ? 0 : 4.9;
     const order = {
       id: "VX-" + Math.random().toString(36).slice(2, 8).toUpperCase(),
@@ -271,11 +313,10 @@ export default function App() {
       total: subtotal + shipping,
       status: "Confirmée",
     };
-    const nextProducts = products.map((p) => {
-      const it = cart.find((c) => c.id === p.id);
-      return it ? { ...p, stock: Math.max(0, p.stock - it.qty) } : p;
-    });
-    persistProducts(nextProducts);
+    // Diminue le stock réel côté serveur pour chaque article commandé
+    await Promise.all(cart.map((it) => decrementStockRemote(it.id, it.qty)));
+    await insertOrderRemote(order);
+    await refreshProducts();
     setOrders((o) => [order, ...o]);
     setLastOrder(order);
     setCart([]);
@@ -327,7 +368,7 @@ export default function App() {
           />
         )}
         {page === "admin" && account?.isAdmin && (
-          <Admin products={products} persistProducts={persistProducts} showToast={showToast} />
+          <Admin products={products} refreshProducts={refreshProducts} showToast={showToast} />
         )}
         {page === "about" && <About goTo={goTo} />}
         {page === "contact" && <ContactFAQ showToast={showToast} />}
@@ -969,54 +1010,79 @@ function Confirmation({ order, goTo, account }) {
 /* ============================================================
    ACCOUNT
    ============================================================ */
-/* Change ce mot de passe pour le tien — c'est lui qui protège l'accès admin.
-   Ce n'est pas un système de sécurité professionnel (le mot de passe est
-   visible dans le code source), mais il empêche n'importe quel visiteur
-   de devenir admin en un clic. Pour une vraie sécurité, il faudra brancher
-   une authentification Supabase plus tard. */
-const ADMIN_PASSWORD = "voxforge-admin-2026";
-
 function Account({ account, setAccount, orders, goTo, showToast }) {
-  const [form, setForm] = useState({ name: "", email: "", wantsAdmin: false, adminPassword: "" });
+  const [mode, setMode] = useState("client"); // "client" | "admin"
+  const [form, setForm] = useState({ name: "", email: "" });
+  const [adminForm, setAdminForm] = useState({ email: "", password: "" });
   const [attempted, setAttempted] = useState(false);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminError, setAdminError] = useState("");
 
   if (!account) {
     const nameError = form.name.trim().length < 2 ? "Indiquez votre nom (2 caractères min)." : "";
     const emailError = !EMAIL_RE.test(form.email) ? "Adresse email invalide." : "";
-    const passwordError = form.wantsAdmin && form.adminPassword !== ADMIN_PASSWORD ? "Mot de passe administrateur incorrect." : "";
-    const valid = !nameError && !emailError && !passwordError;
+    const valid = !nameError && !emailError;
 
-    const submit = () => {
+    const submitClient = () => {
       setAttempted(true);
       if (!valid) return;
-      setAccount({ name: form.name, email: form.email, isAdmin: form.wantsAdmin });
+      setAccount({ name: form.name, email: form.email, isAdmin: false });
       showToast(`Bienvenue, ${form.name}`);
+    };
+
+    const submitAdmin = async (e) => {
+      e.preventDefault();
+      setAdminError("");
+      setAdminLoading(true);
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: adminForm.email,
+        password: adminForm.password,
+      });
+      setAdminLoading(false);
+      if (error) {
+        setAdminError("Email ou mot de passe incorrect.");
+        return;
+      }
+      setAccount({ name: data.user.email, email: data.user.email, isAdmin: true });
+      showToast("Connecté en tant qu'administrateur");
     };
 
     return (
       <div className="vf-section" style={{ maxWidth: 420, margin: "0 auto" }}>
         <h2 className="vf-h2">Connexion</h2>
-        <p className="vf-muted" style={{ marginBottom: 18 }}>Démo : entrez simplement un nom et un email pour créer votre profil.</p>
-        <div className="vf-form-grid" style={{ gridTemplateColumns: "1fr" }}>
-          <FormField error={(attempted || form.name) && nameError}>
-            <input placeholder="Nom" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-          </FormField>
-          <FormField error={(attempted || form.email) && emailError}>
-            <input placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
-          </FormField>
-          <label className="vf-check">
-            <input type="checkbox" checked={form.wantsAdmin} onChange={(e) => setForm({ ...form, wantsAdmin: e.target.checked, adminPassword: "" })} />
-            Je suis l'administrateur
-          </label>
-          {form.wantsAdmin && (
-            <FormField error={attempted && passwordError}>
-              <input type="password" placeholder="Mot de passe administrateur" value={form.adminPassword} onChange={(e) => setForm({ ...form, adminPassword: e.target.value })} />
-            </FormField>
-          )}
+        <div className="vf-tabs" style={{ marginTop: 10, marginBottom: 18 }}>
+          <button className={`vf-tab ${mode === "client" ? "active" : ""}`} onClick={() => setMode("client")}>Je suis client</button>
+          <button className={`vf-tab ${mode === "admin" ? "active" : ""}`} onClick={() => setMode("admin")}>Je suis l'administrateur</button>
         </div>
-        <button className="vf-btn vf-btn-primary" style={{ marginTop: 16 }} onClick={submit}>
-          Se connecter
-        </button>
+
+        {mode === "client" ? (
+          <>
+            <p className="vf-muted" style={{ marginBottom: 18 }}>Démo : entrez simplement un nom et un email pour créer votre profil.</p>
+            <div className="vf-form-grid" style={{ gridTemplateColumns: "1fr" }}>
+              <FormField error={(attempted || form.name) && nameError}>
+                <input placeholder="Nom" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+              </FormField>
+              <FormField error={(attempted || form.email) && emailError}>
+                <input placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              </FormField>
+            </div>
+            <button className="vf-btn vf-btn-primary" style={{ marginTop: 16 }} onClick={submitClient}>
+              Se connecter
+            </button>
+          </>
+        ) : (
+          <form onSubmit={submitAdmin}>
+            <p className="vf-muted" style={{ marginBottom: 18 }}>Réservé au propriétaire de la boutique — vérifié par Supabase.</p>
+            <div className="vf-form-grid" style={{ gridTemplateColumns: "1fr" }}>
+              <input placeholder="Email administrateur" type="email" required value={adminForm.email} onChange={(e) => setAdminForm({ ...adminForm, email: e.target.value })} />
+              <input placeholder="Mot de passe" type="password" required value={adminForm.password} onChange={(e) => setAdminForm({ ...adminForm, password: e.target.value })} />
+            </div>
+            {adminError && <div className="vf-form-alert" style={{ marginTop: 12 }}><AlertCircle size={15} /> {adminError}</div>}
+            <button className="vf-btn vf-btn-primary" style={{ marginTop: 16 }} type="submit" disabled={adminLoading}>
+              {adminLoading ? <><Loader2 size={16} className="vf-spin" /> Vérification…</> : "Se connecter"}
+            </button>
+          </form>
+        )}
       </div>
     );
   }
@@ -1028,7 +1094,7 @@ function Account({ account, setAccount, orders, goTo, showToast }) {
           <h2 className="vf-h2">Bonjour, {account.name}</h2>
           <p className="vf-muted">{account.email}{account.isAdmin && " · Administrateur"}</p>
         </div>
-        <button className="vf-btn vf-btn-ghost" onClick={() => setAccount(null)}><LogOut size={15} /> Déconnexion</button>
+        <button className="vf-btn vf-btn-ghost" onClick={async () => { await supabase.auth.signOut(); setAccount(null); }}><LogOut size={15} /> Déconnexion</button>
       </div>
 
       <h3 className="vf-h3" style={{ marginTop: 32 }}>Historique de commandes</h3>
@@ -1066,11 +1132,12 @@ function emptyProduct() {
   return { name: "", category: "Décoration", material: "PLA", color: "Noir", price: "", stock: "", customizable: false, description: "" };
 }
 
-function Admin({ products, persistProducts, showToast }) {
+function Admin({ products, refreshProducts, showToast }) {
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(emptyProduct());
   const [adding, setAdding] = useState(false);
   const [attempted, setAttempted] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   const startEdit = (p) => {
     setEditingId(p.id);
@@ -1092,31 +1159,48 @@ function Admin({ products, persistProducts, showToast }) {
   const valid = Object.values(errors).every((e) => !e);
   const fieldErr = (key) => (attempted || form[key]) ? errors[key] : "";
 
-  const save = () => {
+  const save = async () => {
     setAttempted(true);
     if (!valid) return;
+    setSaving(true);
     const clean = {
-      ...form,
+      name: form.name,
+      category: form.category,
+      material: form.material,
+      color: form.color,
       price: priceNum,
       stock: stockNum,
-      reviews: form.reviews || [],
+      customizable: form.customizable,
+      description: form.description,
       rating: form.rating || 4.5,
+      reviews: form.reviews || [],
     };
-    if (editingId) {
-      persistProducts(products.map((p) => (p.id === editingId ? { ...p, ...clean } : p)));
-      showToast("Produit mis à jour");
-    } else {
-      const id = "p" + Date.now();
-      persistProducts([...products, { ...clean, id }]);
-      showToast("Produit ajouté");
+    try {
+      if (editingId) {
+        await updateProductRemote(editingId, clean);
+        showToast("Produit mis à jour");
+      } else {
+        await insertProductRemote({ ...clean, id: "p" + Date.now() });
+        showToast("Produit ajouté");
+      }
+      await refreshProducts();
+      cancel();
+    } catch (e) {
+      showToast("Erreur : " + e.message);
+    } finally {
+      setSaving(false);
     }
-    cancel();
   };
 
-  const remove = (id) => {
-    persistProducts(products.filter((p) => p.id !== id));
-    showToast("Produit supprimé");
-    if (editingId === id) cancel();
+  const remove = async (id) => {
+    try {
+      await deleteProductRemote(id);
+      showToast("Produit supprimé");
+      await refreshProducts();
+      if (editingId === id) cancel();
+    } catch (e) {
+      showToast("Erreur : " + e.message);
+    }
   };
 
   const formOpen = adding || editingId;
@@ -1161,8 +1245,8 @@ function Admin({ products, persistProducts, showToast }) {
           )}
           <div className="vf-flex-center" style={{ gap: 10, marginTop: 14 }}>
             <button className="vf-btn vf-btn-ghost" onClick={cancel}>Annuler</button>
-            <button className="vf-btn vf-btn-primary" onClick={save}>
-              <Check size={15} /> Enregistrer
+            <button className="vf-btn vf-btn-primary" onClick={save} disabled={saving}>
+              {saving ? <Loader2 size={15} className="vf-spin" /> : <Check size={15} />} Enregistrer
             </button>
           </div>
         </div>
@@ -1553,4 +1637,3 @@ html, body { background:#0a0a0f; margin:0; }
 .vf-toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:var(--cyan); color:#04121a; padding:11px 20px; border-radius:10px; display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; z-index:100; box-shadow:0 6px 24px rgba(0,240,255,0.35); animation:vf-toast-in .2s ease; }
 @keyframes vf-toast-in { from{ opacity:0; transform:translate(-50%,10px);} to{ opacity:1; transform:translate(-50%,0);} }
 `;
-
